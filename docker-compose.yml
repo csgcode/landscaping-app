@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16
+    container_name: drf_pg
+    environment:
+      POSTGRES_DB: landscape_db
+      POSTGRES_USER: drf_user
+      POSTGRES_PASSWORD: drf_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drf_user -d landscape_db"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  pgdata:
