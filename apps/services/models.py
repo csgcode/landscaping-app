@@ -12,7 +12,7 @@ class Service(models.Model):
     priority = models.CharField(
         max_length=10,
         choices=Priority.choices,
-        null = True
+        default=Priority.MEDIUM
     )
     base_price = models.DecimalField(max_digits=10, decimal_places=2)
     duration_hours = models.IntegerField()
