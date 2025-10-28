@@ -10,9 +10,7 @@ class Service(models.Model):
     name = models.CharField(max_length=200)
     description = models.TextField()
     priority = models.CharField(
-        max_length=10,
-        choices=Priority.choices,
-        default=Priority.MEDIUM
+        max_length=10, choices=Priority.choices, default=Priority.MEDIUM
     )
     base_price = models.DecimalField(max_digits=10, decimal_places=2)
     duration_hours = models.IntegerField()
