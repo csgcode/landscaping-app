@@ -1,7 +1,7 @@
 from django.urls import path
-from .views import AppointmentListView
+from .api_views import AppointmentListView
 
 app_name = "scheduling"
 urlpatterns = [
-    path("appointments/", AppointmentListView.as_view(), name="appointment-list")
+    path("appointments/", AppointmentListView.as_view(), name="appointments-list")
 ]

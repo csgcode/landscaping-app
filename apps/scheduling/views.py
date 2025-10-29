@@ -2,6 +2,7 @@ from .models import Appointment
 from django.http import JsonResponse
 from django.views.decorators.http import require_GET
 
+import warnings
 import logging
 
 logger = logging.getLogger(__name__)
@@ -10,9 +11,17 @@ logger = logging.getLogger(__name__)
 @require_GET
 def appointment_list_view(request):
     """
-    This is a depreciated view, to list the first 100 Appoinments ordered_by scheduled view.
-    Use api/ endpoints to get list of appoinments with pagination.
+    DEPRECATED: This view is deprecated.
+    
+    Use the API endpoint `/api/appointments/` with pagination instead.
+    
+    This view will be removed in a future release.
     """
+
+    warnings.warn(
+        "appointment_list_view is deprecated. Use /api/v1/appointments/ with pagination.",
+        stacklevel=2
+    )
     qs = (
         Appointment.objects.select_related("service", "client")
         .values(
@@ -24,7 +33,7 @@ def appointment_list_view(request):
             client_name="client__name",
             service_name="service__name",
         )
-        .order_by("-schedled_date", "-id")[:100]
+        .order_by("-scheduled_date", "-id")[:100]
     )
 
     logger.debug("Fetched %d appointments for list view", qs.count())
