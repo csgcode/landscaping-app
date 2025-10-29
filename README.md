@@ -189,10 +189,61 @@ Main focus of decomposition has been given to make it a simple yet separating it
   - Initially we would want the django application to be modularized. Also the core logic can be moved to modular python packages which can be reused in the microservices (optional)
   - Would start decomposition with extracting weather and notification services first. At this time the django monolith will remain but with these services.
   - Now the rest of the services can be split (User service + Catalog) and (Scheduling service). Assuming Catalog and services are linked to Clients and it would still make sense at this point to keep catalog service inside the User service for now. Later if required Catalog service can be extracted, mainly because this is read heavy.
-  
+
 
 #### Diagram
-TODO mermaid diagram.
+```mermaid
+
+flowchart TD
+    subgraph "Clients (Web/Mobile)"
+        direction LR
+        API_GW(API Gateway)
+    end
+
+    subgraph "Core Microservices"
+        direction TB
+        UserService(User Service: Clients, TeamMembers)
+        CatalogService(Catalog Service: Services)
+        SchedulingService(Scheduling Service: Appointments)
+        NotificationService(Notification Service: NotificationLogs)
+        WeatherService(Weather Service: Weather Cache)
+    end
+    
+    subgraph "External Systems"
+        direction TB
+        ThirdPartyWeather(3rd Party Weather API)
+        EmailProvider(Email Provider: e.g., AWS SES)
+    end
+
+    EventBus(Event Bus: e.g., AWS SNS/EventBridge)
+
+    %% Communication Flows
+    API_GW -- /login, /clients --> UserService
+    API_GW -- /services --> CatalogService
+    API_GW -- /appointments --> SchedulingService
+
+    SchedulingService -- Sync Call (Validate Service) --> CatalogService
+    SchedulingService -- Sync Call (Validate Client) --> UserService
+    
+    WeatherService --> ThirdPartyWeather
+
+    SchedulingService -- Async Call (Check Weather) --> WeatherService
+    
+    SchedulingService -- Event --> EventBus
+    UserService -- Event --> EventBus
+    WeatherService -- Event --> EventBus
+    
+    EventBus -- appointment.created --> NotificationService
+    EventBus -- team.unavailable --> SchedulingService
+    EventBus -- weather.alert --> SchedulingService
+    
+    NotificationService --> EmailProvider
+    
+    %% Styling
+    classDef service fill:#ECECFF,stroke:#9370DB,stroke-width:2px;
+    class UserService,CatalogService,SchedulingService,NotificationService,WeatherService service;
+
+```
 
 ## Future enhancements
 - Since priority field might be used to query often, It is recommended to set the field as `db_index`
