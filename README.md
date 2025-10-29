@@ -142,10 +142,62 @@ The plan is to split the adding of new default field to in 3 stage approach for 
 While this 2 stage approach is implemented it is important  to have strong code/admin level checks to set defaults.
 
 ### Task 3
+Details:
+
+- API List view: [api_views.py](https://github.com/csgcode/landscaping-app/blob/main/apps/scheduling/api_views.py)
+- Future enhancements:
+  - Add ability to filter with multiple status.
+
+
+## Part 2
+
+### Architectural Overview
+
+### Service Decomposition.
+Proposing the decomposition of the django monolith into microservices which will be able to handle future growth of the application and its development effort.
+Main focus of decomposition has been given to make it a simple yet separating it by domain.
+
+1. User Service with Identity management:
+  - This services manages all users in the system including Admins, Team Members, Clients, Authentication and permissions.
+  - Core service, should be able to handle the huge traffic and scale independently.
+
+
+2. Catalog Service
+  - Includes services, products and pricing details
+  - Largely a ready heavy service.
+
+3. Scheduling Service
+  - Manages the appointments CRUD, incorporates team availability/assignment workflows.
+  - Core service, should be able to handle the huge traffic and scale independently.
+  - read and write heavy
+
+4. Notification Service
+  - Manages all outbound communications including, sending notifications, emails, sms, alerts to team members and clients.
+  - Integrates with 3rd party email/SMS providers ex:Twilio
+
+5. Weather Service
+  - Integrates with 3rd party weather APIs and updates about adverse weather conditions and changes in services locations to clients.
+
+
+#### Justification of the design and planned decomposition
+- Each service has been developed with a singular purpose. The Notification Service only sends messages. The Weather service provide and know only about the weather.
+- Scheduling and User services are the core and important services in this architecture.
+
+- Planned decomposition:
+  - Since the existing django application is running in production with high daily active usage. Ideally we want to migrate to microservices with
+  minimal disruptions. Hence planning to migrate to micro-services starting with less critical "low-hanging fruits" services, Notifications and Weather services.
+  - Initially we would want the django application to be modularized. Also the core logic can be moved to modular python packages which can be reused in the microservices (optional)
+  - Would start decomposition with extracting weather and notification services first. At this time the django monolith will remain but with these services.
+  - Now the rest of the services can be split (User service + Catalog) and (Scheduling service). Assuming Catalog and services are linked to Clients and it would still make sense at this point to keep catalog service inside the User service for now. Later if required Catalog service can be extracted, mainly because this is read heavy.
+  
+
+#### Diagram
+TODO mermaid diagram.
 
 ## Future enhancements
 - Since priority field might be used to query often, It is recommended to set the field as `db_index`
-- Set `db_index` for all models with appropriate high use fields
+- Similarly set `db_index` for all models with appropriate high use fields
+- All API related views are currently added to `/<app_name>/api_views.py`, This is assuming normal django views exists and uses `/<app_name>/views.py`
 
 
 
