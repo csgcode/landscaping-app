@@ -153,7 +153,7 @@ Details:
 
 ### Architectural Overview
 
-### Service Decomposition.
+### Task 1: Service Decomposition.
 Proposing the decomposition of the django monolith into microservices which will be able to handle future growth of the application and its development effort.
 Main focus of decomposition has been given to make it a simple yet separating it by domain.
 
@@ -182,6 +182,8 @@ Main focus of decomposition has been given to make it a simple yet separating it
 #### Justification of the design and planned decomposition
 - Each service has been developed with a singular purpose. The Notification Service only sends messages. The Weather service provide and know only about the weather.
 - Scheduling and User services are the core and important services in this architecture.
+- Independent Scalability: The Catalog Service (read-heavy) can be scaled by adding database replicas. The Scheduling Service (write-heavy, complex logic) can be scaled by adding more compute instances. This is more cost-effective than scaling a monolith.
+- Resilience: If the Weather Service fails, clients can still book appointments (perhaps with a warning). If the Notification Service fails, the AppointmentCreated events will queue up and be processed when it recovers, ensuring no notifications are lost.
 
 - Planned decomposition:
   - Since the existing django application is running in production with high daily active usage. Ideally we want to migrate to microservices with
@@ -245,11 +247,88 @@ flowchart TD
 
 ```
 
+### Task 2: Event driven Architecture
+The following describes what happens between services for a specific scenarios
+
+All events have a common base structure:
+```json
+{
+  "id": "01HF5V0E6WN2Z2G4X0N8E1T7DW",             // event id
+  "type": "…",                                   // event name + version
+  "source": "scheduling",                        // producing service
+  "occurredAt": "2025-10-30T09:12:11Z",          // datetime
+  "correlationId": "req-7b3cXXX",                // tracing
+  "data": { /* payload */ }
+}
+```
+
+1. When an appointment is created:
+  Producer: Scheduling service
+  Event: `scheduling.appointment.created`
+  
+  Payload:
+  ```json
+  {
+  "id": "apt_987",
+  "client": 456,
+  "service": 23,
+  "scheduled_date": "2025-11-02T10:00:00Z",
+  "status": "scheduled",
+  "notes": "Gate A1 pass code 1234",
+  "created_at": "2025-10-30T09:12:10Z"
+  }
+  ```
+  Consumers: 
+  - Notification Service -> sends confirmation (email/SMS), 
+  - Weather Service -> schedules/does forecast check for the client’s address at scheduled_date.
+  
+2. Weather conditions change
+  Weather service polls external APIs to get weather updates, and emits events on adverse weather.
+
+  Event: `weather.alert.v1`
+  Payload:
+  ```json
+  {
+  "severity": "high",
+  "reason": "heavy_rain",
+  "valid_from": "2025-11-02T08:00:00Z",
+  "valid_to": "2025-11-02T12:00:00Z",
+  "area": ["SW1A 1AA"]
+  }
+```
+  Consumers:
+  - Scheduling Service -> Finds overlapping Appointments whose Clients are in the affected area, flags services “at risk” for the area and date. Which can then trigger another events for Notifications (optional). Scheduling service can suggest alternate days as well. [Marketed as AI feature]
+  - Notification Service -> Optionally send notifications if the client has subscribed to an area weather event.
+
+3. A team member becomes unavailable
+  Producer: User Service
+  Event: `user.team_member.availability.changed.v1`
+  Payload:
+
+  ```json
+  {
+  "id": 321,
+  "user": 78,
+  "specialties": [23, 41],
+  "is_available": false
+  }
+```
+  Consumers:
+  - Scheduling Service -> finds upcoming appointments assigned to this team member. Creates a Notification with effected services and clients.
+  Tries auto reassignment [Marketed as AI feature]
+  - Notification Service -> Notifies the Client/Customer about upcoming reassignment tasks.
+
+
+
+
+
+
+
 ## Future enhancements
 - Since priority field might be used to query often, It is recommended to set the field as `db_index`
 - Similarly set `db_index` for all models with appropriate high use fields
 - All API related views are currently added to `/<app_name>/api_views.py`, This is assuming normal django views exists and uses `/<app_name>/views.py`
-
+- Add `modified_at` timestamp to all models.py to track all updates
 
 
 
