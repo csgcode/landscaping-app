@@ -1,13 +1,14 @@
 
-# Scheduling application - Django | DRF
+# Scheduling application - Django | DRF | AWS
 A scheduling application used by landscaping service providers.
 
 
 ## Features
 
-* appointments scheduling
+* Appointments scheduling
 * Service and Catalog management
-* 
+* Team members management
+* Invoicing and billing
 
 ## Tech Stack
 
@@ -76,17 +77,17 @@ uv run python manage.py runserver
 **endpoints sample usage:**
 
 ```
-GET   /api/v1/<resource>/?limit=20&offset=0&ordering=-created_at&search=<q>
-POST  /api/v1/<resource>/
+GET   /api/v1/appointments/?limit=20&offset=0&ordering=-created_at&search=<q>
+POST  /api/v1/appointments/
 ```
 
 **Detail endpoints:**
 
 ```
-GET    /api/v1/<resource>/{id}/
-PATCH  /api/v1/<resource>/{id}/
-PUT    /api/v1/<resource>/{id}/
-DELETE /api/v1/<resource>/{id}/
+GET    /api/v1/services/{id}/
+PATCH  /api/v1/services/{id}/
+PUT    /api/v1/services/{id}/
+DELETE /api/v1/services/{id}/
 ```
 
 ## Development
@@ -97,8 +98,76 @@ uv run black .
 uv run ruff check .
 
 # Tests
+# Run all tests
 uv run pytest
+
+# Run with coverage
+uv run pytest --cov=. --cov-report=html --cov-report=term-missing
+
+# Run specific app tests
+uv run pytest apps/scheduling/
+
+# Run with verbose output
+uv run pytest -v
 ```
+
+
+## Deployment
+The application uses CircleCI for automated CI/CD to AWS EC2.
+
+## Troubleshooting
+
+**Database connection errors:**
+```bash
+docker compose ps db  # Check if PostgreSQL is running
+docker compose logs db  # Check database logs
+```
+
+**Migration conflicts:**
+```bash
+uv run python manage.py showmigrations
+uv run python manage.py migrate --fake-initial
+```
+
+**Dependency issues:**
+```bash
+rm -rf .venv uv.lock
+uv sync
+```
+
+## Contributing
+
+1. Create a feature branch from `main`
+2. Make your changes
+3. Run tests and linters: `uv run pytest && uv run black . && uv run ruff check .`
+4. Push and create a PR
+5. Wait for CI checks to pass
+6. Request review from 2 team members
+7. Merge to `main` triggers automatic deployment
+
+### CI/CD Pipeline
+Pull Requests (non-main branches):
+
+- Run tests with coverage reporting
+- Code quality checks (Ruff, Black)
+- Security scanning (pip-audit, Bandit)
+
+Main Branch (on merge):
+
+- All checks above, plus:
+- Automated deployment to EC2 production server
+
+#### Required CircleCI Environment Variables
+Configure in CircleCI project settings:
+```sh
+EC2_USER              # SSH user for EC2 instance
+EC2_HOST              # EC2 instance hostname/IP
+EC2_DEPLOY_SCRIPT_PATH # Path to deploy script (default: /srv/landscape/deploy.sh)
+COVERAGE_MINIMUM      # Minimum test coverage % (default: 80)
+DJANGO_SECRET_KEY     # Django secret
+```
+Also add EC2 SSH key fingerprint to CircleCI SSH permissions.
+---
 
 ---
 Task details and discussions
@@ -139,7 +208,7 @@ The plan is to split the adding of new default field to in 3 stage approach for 
 2. Create and run a management command to backfill existing data in batches and update `NULL` values in the table to a default value. This can also be done on low traffic periods -- command [backfill_priority.py](https://github.com/csgcode/landscaping-app/blob/main/apps/services/management/commands/backfill_priority.py)
 3. Update the `models.py` to set a default and remove the null=True -- see migration [0003_alter_service_priority.py](https://github.com/csgcode/landscaping-app/blob/main/apps/services/migrations/0003_alter_service_priority.py)
 
-While this 2 stage approach is implemented it is important  to have strong code/admin level checks to set defaults.
+While this 3 stage approach is implemented it is important  to have strong code/admin level checks to set defaults.
 
 ### Task 3
 Details:
@@ -184,16 +253,17 @@ Main focus of decomposition has been given to make it a simple yet separating it
 - Scheduling and User services are the core and important services in this architecture.
 - Independent Scalability: The Catalog Service (read-heavy) can be scaled by adding database replicas. The Scheduling Service (write-heavy, complex logic) can be scaled by adding more compute instances. This is more cost-effective than scaling a monolith.
 - Resilience: If the Weather Service fails, clients can still book appointments (perhaps with a warning). If the Notification Service fails, the AppointmentCreated events will queue up and be processed when it recovers, ensuring no notifications are lost.
+- All producers use the outbox pattern. all consumers perform idempotent processing using event.id (DynamoDB/SQL unique). SQS retries + DLQs are enabled. (optional)
+- Security consideration: Most events carrys IDs only to minimize PII on the Buses. For accessing the PII the Services, like Notification service, fetches required details from the User Service
 
 - Planned decomposition:
-  - Since the existing django application is running in production with high daily active usage. Ideally we want to migrate to microservices with
-  minimal disruptions. Hence planning to migrate to micro-services starting with less critical "low-hanging fruits" services, Notifications and Weather services.
-  - Initially we would want the django application to be modularized. Also the core logic can be moved to modular python packages which can be reused in the microservices (optional)
-  - Would start decomposition with extracting weather and notification services first. At this time the django monolith will remain but with these services.
-  - Now the rest of the services can be split (User service + Catalog) and (Scheduling service). Assuming Catalog and services are linked to Clients and it would still make sense at this point to keep catalog service inside the User service for now. Later if required Catalog service can be extracted, mainly because this is read heavy.
+  - Since the existing django application is running in production with high daily active usage. Ideally we want to migrate to microservices with minimal disruptions. Hence planning to migrate to micro-services starting with less critical "low-hanging fruits" services, Notifications and Weather services.
+  - Initially we would want the django application to be modularized. Additionally, the core logic can be moved to modular python packages which can be reused in the microservices (optional)
+  - Would start decomposition with extracting weather and notification services first. At this time the django monolith will remain but without these services.
+  - Now the rest of the services can be split (User service + Catalog) and (Scheduling service). Assuming Catalog and services are linked to Clients and it would still make sense at this point to keep catalog service inside the User service for now. Later if required Catalog service can be extracted, mainly because this is primarily read heavy and would make sense to keep it separate from User service.
 
 
-#### Diagram
+#### Architectural overview diagram
 ```mermaid
 
 flowchart TD
@@ -217,7 +287,7 @@ flowchart TD
         EmailProvider(Email Provider: e.g., AWS SES)
     end
 
-    EventBus(Event Bus: e.g., AWS SNS/EventBridge)
+    EventBus(Event Bus: e.g., AWS EventBridge/SQS/SNS)
 
     %% Communication Flows
     API_GW -- /login, /clients --> UserService
@@ -248,23 +318,27 @@ flowchart TD
 ```
 
 ### Task 2: Event driven Architecture
-The following describes what happens between services for a specific scenarios
+The following describes what happens between services for a specific scenarios.
 
-All events have a common base structure:
+Few design decisions:
+
+- All events have a common base structure:
 ```json
 {
   "id": "01HF5V0E6WN2Z2G4X0N8E1T7DW",             // event id
   "type": "…",                                   // event name + version
   "source": "scheduling",                        // producing service
-  "occurredAt": "2025-10-30T09:12:11Z",          // datetime
-  "correlationId": "req-7b3cXXX",                // tracing
+  "occurred_at": "2025-10-30T09:12:11Z",          // datetime
+  "correlation_id": "req-7b3cXXX",                // tracing
   "data": { /* payload */ }
 }
 ```
+- All events have version numbers, breaking changes create .v2 events. `.v1` is kept until consumers migrate.
 
 1. When an appointment is created:
+
   Producer: Scheduling service
-  Event: `scheduling.appointment.created`
+  Event: `scheduling.appointment.created.v1`
   
   Payload:
   ```json
@@ -285,7 +359,9 @@ All events have a common base structure:
 2. Weather conditions change
   Weather service polls external APIs to get weather updates, and emits events on adverse weather.
 
-  Event: `weather.alert.v1`
+  Producer: Weather Service
+  Event: `weather.alert.updated.v1`
+
   Payload:
   ```json
   {
@@ -296,13 +372,16 @@ All events have a common base structure:
   "area": ["SW1A 1AA"]
   }
 ```
+
   Consumers:
   - Scheduling Service -> Finds overlapping Appointments whose Clients are in the affected area, flags services “at risk” for the area and date. Which can then trigger another events for Notifications (optional). Scheduling service can suggest alternate days as well. [Marketed as AI feature]
   - Notification Service -> Optionally send notifications if the client has subscribed to an area weather event.
 
 3. A team member becomes unavailable
+  
   Producer: User Service
   Event: `user.team_member.availability.changed.v1`
+  
   Payload:
 
   ```json
@@ -313,6 +392,7 @@ All events have a common base structure:
   "is_available": false
   }
 ```
+
   Consumers:
   - Scheduling Service -> finds upcoming appointments assigned to this team member. Creates a Notification with effected services and clients.
   Tries auto reassignment [Marketed as AI feature]

@@ -1,0 +1,132 @@
+version: 2.1
+
+commands:
+  setup-uv-deps:
+    description: "Install uv, restore cache, and sync dependencies"
+    steps:
+      - restore_cache:
+          keys:
+            - v1-uv-{{ .Branch }}-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+            - v1-uv-{{ .Branch }}-
+      - run:
+          name: Install uv and project deps
+          command: |
+            python -m pip install -U pip uv
+            uv sync --dev
+      - save_cache:
+          key: v1-uv-{{ .Branch }}-{{ checksum "pyproject.toml" }}-{{ checksum "uv.lock" }}
+          paths:
+            - ".venv"
+            - "~/.cache/uv"
+
+jobs:
+  build_test:
+    docker:
+      - image: cimg/python:3.12
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - setup-uv-deps
+      - run:
+          name: Run tests with coverage and JUnit
+          command: |
+            mkdir -p test-reports coverage_html coverage
+            uv run pytest \
+              --junitxml=test-reports/junit.xml \
+              --cov=. \
+              --cov-report=xml:coverage/coverage.xml \
+              --cov-report=html:coverage_html \
+              --cov-report=term-missing \
+              --cov-fail-under=${COVERAGE_MINIMUM:-80}
+      - store_test_results:
+          path: test-reports
+      - store_artifacts:
+          path: test-reports
+          destination: junit
+      - store_artifacts:
+          path: coverage/coverage.xml
+          destination: coverage/coverage.xml
+      - store_artifacts:
+          path: coverage_html
+          destination: coverage_html
+
+  quality_check:
+    docker:
+      - image: cimg/python:3.12
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - setup-uv-deps
+      - run:
+          name: Ruff + Black checks
+          command: |
+            uv run ruff check .
+            uv run black --check .
+
+  security_scan:
+    docker:
+      - image: cimg/python:3.12
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - setup-uv-deps
+      - run:
+          name: Dependency vulnerabilities (pip-audit)
+          command: |
+            uv run pip-audit -l --strict --progress-spinner=off -f json -o pip-audit.json || echo $? > /tmp/pipaudit_exit
+      - run:
+          name: Code security (bandit)
+          command: |
+            uv run bandit -q -r . -f json -o bandit.json || echo $? > /tmp/bandit_exit
+      - store_artifacts:
+          path: pip-audit.json
+          destination: security/pip-audit.json
+      - store_artifacts:
+          path: bandit.json
+          destination: security/bandit.json
+      - run:
+          name: Fail if scanners reported issues (strict mode)
+          command: |
+            PIPAUDIT_EXIT=$(cat /tmp/pipaudit_exit 2>/dev/null || echo 0)
+            BANDIT_EXIT=$(cat /tmp/bandit_exit 2>/dev/null || echo 0)
+            if [ "$PIPAUDIT_EXIT" != "0" ] || [ "$BANDIT_EXIT" != "0" ]; then
+              echo "Security scan detected issues. See artifacts."
+              exit 1
+            fi
+
+  deploy_ec2:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "SSH_KEY_FINGERPRINT"
+      - run:
+          name: Deploy to EC2
+          command: |
+            ssh -o StrictHostKeyChecking=no "${EC2_USER}@${EC2_HOST}" \
+              "bash -lc '${EC2_DEPLOY_SCRIPT_PATH:-/srv/landscape/deploy.sh}'"
+
+workflows:
+  validate_pr:
+    jobs:
+      - build_test:
+          filters: { branches: { ignore: main } }
+      - quality_check:
+          filters: { branches: { ignore: main } }
+      - security_scan:
+          filters: { branches: { ignore: main } }
+
+  build_test_deploy:
+    jobs:
+      - build_test:
+          filters: { branches: { only: main } }
+      - quality_check:
+          requires: [build_test]
+          filters: { branches: { only: main } }
+      - security_scan:
+          requires: [quality_check]
+          filters: { branches: { only: main } }
+      - deploy_ec2:
+          requires: [security_scan]
+          filters: { branches: { only: main } }
