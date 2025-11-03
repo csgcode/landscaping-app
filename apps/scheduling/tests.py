@@ -2,6 +2,7 @@ import pytest
 from datetime import datetime, timedelta
 from decimal import Decimal
 from rest_framework.test import APIClient
+from django.contrib.auth import get_user_model
 
 from apps.users.models import Client
 from apps.services.models import Service
@@ -53,10 +54,19 @@ def make_appointments():
         )
     yield
 
-@pytest.mark.django_db
-def test_list_paginates_and_shapes(make_appointments):
+API_PREFIX = "/api/v1"
+
+@pytest.fixture
+def auth_client(db):
+    User = get_user_model()
+    user = User.objects.create_user(username="testuser", email="test@example.com", password="password")
     client = APIClient()
-    resp = client.get("/appointments/?limit=10&offset=0")
+    client.force_authenticate(user=user)
+    return client
+
+@pytest.mark.django_db
+def test_list_paginates_and_shapes(make_appointments, auth_client):
+    resp = auth_client.get(f"{API_PREFIX}/appointments/?limit=10&offset=0")
     assert resp.status_code == 200
     data = resp.json()
     assert "results" in data
@@ -66,10 +76,9 @@ def test_list_paginates_and_shapes(make_appointments):
     assert keys.issubset(results[0].keys())
 
 @pytest.mark.django_db
-def test_filters_by_date_and_status(make_appointments):
-    client = APIClient()
-    url = "/appointments/?from=2025-10-01&to=2025-10-31&status=scheduled"
-    resp = client.get(url)
+def test_filters_by_date_and_status(make_appointments, auth_client):
+    url = f"{API_PREFIX}/appointments/?from=2025-10-01&to=2025-10-31&status=scheduled"
+    resp = auth_client.get(url)
     assert resp.status_code == 200
     results = resp.json()["results"]
     assert results
@@ -79,26 +88,23 @@ def test_filters_by_date_and_status(make_appointments):
         assert r["status"] == "scheduled"
 
 @pytest.mark.django_db
-def test_bad_date_returns_400(make_appointments):
-    client = APIClient()
-    resp = client.get("/appointments/?from=2025-99-01&to=2025-10-31")
+def test_bad_date_returns_400(make_appointments, auth_client):
+    resp = auth_client.get(f"{API_PREFIX}/appointments/?schedule_start_date=2025-99-01&schedule_end_date=2025-10-31")
     assert resp.status_code == 400
 
 @pytest.mark.django_db
-def test_status_validation_returns_400(make_appointments):
-    client = APIClient()
-    resp = client.get("/appointments/?status=NOPE")
+def test_status_validation_returns_400(make_appointments, auth_client):
+    resp = auth_client.get(f"{API_PREFIX}/appointments/?status=NOPE")
     assert resp.status_code == 400
 
 @pytest.mark.django_db
-def test_throttle_hits_429(settings, make_appointments):
+def test_throttle_hits_429(settings, make_appointments, auth_client):
     settings.REST_FRAMEWORK = getattr(settings, "REST_FRAMEWORK", {})
     rates = getattr(settings.REST_FRAMEWORK, "DEFAULT_THROTTLE_RATES", {})
-    rates["appointments"] = "3/min"
+    rates["user"] = "3/min"
     settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"] = rates
-    client = APIClient()
-    url = "/appointments/"
-    for _ in range(3):
-        assert client.get(url).status_code == 200
-    resp = client.get(url)
+    url = f"{API_PREFIX}/appointments/"
+    for _ in range(50):
+        assert auth_client.get(url).status_code == 200
+    resp = auth_client.get(url)
     assert resp.status_code == 429

@@ -398,11 +398,8 @@ Few design decisions:
   Tries auto reassignment [Marketed as AI feature]
   - Notification Service -> Notifies the Client/Customer about upcoming reassignment tasks.
 
-
-
-
-
-
+## Part 3
+Partial and in progress implementation can be found in branch -> [feature/sam](https://github.com/csgcode/landscaping-app/tree/feature/sam)
 
 ## Future enhancements
 - Since priority field might be used to query often, It is recommended to set the field as `db_index`
