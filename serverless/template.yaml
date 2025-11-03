@@ -20,6 +20,11 @@ Parameters:
     Type: String
     Default: ''
     Description: Secrets Manager ARN that stores the weather API key (leave blank to skip)
+  WeatherRefreshRate:
+    Type: String
+    Default: rate(4 hours)
+    Description: EventBridge schedule that runs the weather cache refresher.
+
 
 Globals:
   Function:
@@ -44,6 +49,8 @@ Globals:
         NOTIFICATIONS_TOPIC_ARN: !Ref NotificationsTopic
         WEATHER_API_KEY_SECRET_ARN: !Ref WeatherApiKeySecretArn
         API_TIMEOUT: 5
+        WEATHER_TRACKING_TABLE_NAME: !Sub '${Environment}-${ProjectName}-weather-tracking'
+        WEATHER_CACHE_TABLE_NAME: !Sub '${Environment}-${ProjectName}-weather-cache'
     Tags:
       Project: !Ref ProjectName
       Environment: !Ref Environment
@@ -175,6 +182,56 @@ Resources:
         - Key: ManagedBy
           Value: SAM
 
+  WeatherTrackingTable:
+  Type: AWS::DynamoDB::Table
+  Properties:
+    TableName: !Sub '${Environment}-${ProjectName}-weather-tracking'
+    BillingMode: PAY_PER_REQUEST
+    SSESpecification: { SSEEnabled: true }
+    PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+    AttributeDefinitions:
+      - { AttributeName: tracking_id, AttributeType: S }
+      - { AttributeName: status, AttributeType: S }
+      - { AttributeName: next_check_at, AttributeType: S }
+      - { AttributeName: location, AttributeType: S }
+      - { AttributeName: scheduled_at, AttributeType: S }
+    KeySchema:
+      - { AttributeName: tracking_id, KeyType: HASH }
+    GlobalSecondaryIndexes:
+      - IndexName: by_status_nextcheck
+        Projection: { ProjectionType: ALL }
+        KeySchema:
+          - { AttributeName: status, KeyType: HASH }
+          - { AttributeName: next_check_at, KeyType: RANGE }
+    TimeToLiveSpecification:
+      AttributeName: ttl
+      Enabled: true
+    Tags:
+      - { Key: Project, Value: !Ref ProjectName }
+      - { Key: Environment, Value: !Ref Environment }
+      - { Key: ManagedBy, Value: SAM }
+      - { Key: ServiceArea, Value: Weather }
+
+WeatherCacheTable:
+  Type: AWS::DynamoDB::Table
+  Properties:
+    TableName: !Sub '${Environment}-${ProjectName}-weather-cache'
+    BillingMode: PAY_PER_REQUEST
+    SSESpecification: { SSEEnabled: true }
+    PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+    AttributeDefinitions:
+      - { AttributeName: cache_key, AttributeType: S }   # "<POSTCODE>#YYYY-MM-DD"
+    KeySchema:
+      - { AttributeName: cache_key, KeyType: HASH }
+    TimeToLiveSpecification:
+      AttributeName: ttl
+      Enabled: true
+    Tags:
+      - { Key: Project, Value: !Ref ProjectName }
+      - { Key: Environment, Value: !Ref Environment }
+      - { Key: ManagedBy, Value: SAM }
+      - { Key: ServiceArea, Value: Weather }
+
   ReminderDLQ:
     Type: AWS::SQS::Queue
     Properties:
@@ -274,7 +331,6 @@ Resources:
 
   ### -------------------- Lambdas --------------------
 
-  # create-appointment (API)
   CreateAppointmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -317,54 +373,53 @@ Resources:
             Path: /appointments
             Method: post
 
-  # check-weather (SQS consumer)
   CheckWeatherFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub '${Environment}-${ProjectName}-check-weather'
-      Description: Consume weather-check messages, call external weather API, update risk, publish notifications
-      CodeUri: src/check_weather/
-      Timeout: 60
-      Policies:
-        - Version: '2012-10-17'
-          Statement:
-            - Sid: DdbRW
-              Effect: Allow
-              Action:
-                - dynamodb:GetItem
-                - dynamodb:UpdateItem
-              Resource:
-                - !GetAtt AppointmentsTable.Arn
-                - !GetAtt ClientsTable.Arn
-            - Sid: SQSConsume
-              Effect: Allow
-              Action:
-                - sqs:ReceiveMessage
-                - sqs:DeleteMessage
-                - sqs:GetQueueAttributes
-                - sqs:ChangeMessageVisibility
-              Resource: !GetAtt WeatherCheckQueue.Arn
-            - Sid: SNSPublish
-              Effect: Allow
-              Action: sns:Publish
-              Resource: !Ref NotificationsTopic
-            - Sid: GetSecret
-              Effect: Allow
-              Action:
-                - secretsmanager:GetSecretValue
-              Resource: !If
-                - HasSecret
-                - !Ref WeatherApiKeySecretArn
-                - !Ref AWS::NoValue
-      Events:
-        WeatherQueueEvent:
-          Type: SQS
-          Properties:
-            Queue: !GetAtt WeatherCheckQueue.Arn
-            BatchSize: 5
-            MaximumBatchingWindowInSeconds: 5
+  Type: AWS::Serverless::Function
+  Properties:
+    FunctionName: !Sub '${Environment}-${ProjectName}-check-weather'
+    Description: EventBridge-scheduled job to refresh daily weather cache for due locations
+    CodeUri: serverless/src/functions
+    Handler: check_weather.handler
+    Timeout: 120
+    Environment:
+      Variables:
+        WEATHER_TRACKING_TABLE_NAME: !Ref WeatherTrackingTable
+        WEATHER_CACHE_TABLE_NAME: !Ref WeatherCacheTable
+        WEATHER_API_KEY_SECRET_ARN: !Ref WeatherApiKeySecretArn
+        MAX_LOCATIONS_PER_CYCLE: 200
+        LOOKAHEAD_DAYS: 7
+    Policies:
+      - Version: '2012-10-17'
+        Statement:
+          - Sid: WeatherDdbAccess
+            Effect: Allow
+            Action:
+              - dynamodb:Query
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+            Resource:
+              - !GetAtt WeatherTrackingTable.Arn
+              - !Sub '${WeatherTrackingTable.Arn}/index/by_status_nextcheck'
+              - !GetAtt WeatherCacheTable.Arn
+          - Sid: SecretsRead
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !If [ HasSecret, !Ref WeatherApiKeySecretArn, !Ref AWS::NoValue ]
+    Events:
+      WeatherRefreshSchedule:
+        Type: Schedule
+        Properties:
+          Schedule: !Ref WeatherRefreshRate
+          Name: !Sub '${Environment}-${ProjectName}-weather-refresh'
+          Description: Refresh daily weather cache from tracking (EventBridge)
+          Enabled: true
+    Tags:
+      Project: !Ref ProjectName
+      Environment: !Ref Environment
+      ManagedBy: SAM
+      ServiceArea: Weather
 
-  # send-reminder (SQS consumer)
   SendReminderFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -402,7 +457,6 @@ Resources:
             BatchSize: 5
             MaximumBatchingWindowInSeconds: 5
 
-  ### -------------------- CloudWatch LogGroups (explicit retention) --------------------
   CreateAppointmentLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -475,3 +529,11 @@ Outputs:
   NotificationsTopicArn:
     Description: SNS notifications topic ARN
     Value: !Ref NotificationsTopic
+  
+  WeatherTrackingTableName:
+    Description: Weather tracking table name
+    Value: !Ref WeatherTrackingTable
+  
+  WeatherCacheTableName:
+    Description: Weather cache table name
+    Value: !Ref WeatherCacheTable
