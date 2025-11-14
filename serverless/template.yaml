@@ -1,0 +1,698 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless appointment scheduling (API + Lambdas + DynamoDB + SNS + SQS)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: landscaping-app
+    Description: Logical project/app name used in resource names and tags
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch Logs retention in days
+  WeatherApiKeySecretArn:
+    Type: String
+    Default: ''
+    Description: Secrets Manager ARN that stores the weather API key (leave blank to skip)
+  WeatherRefreshRate:
+    Type: String
+    Default: rate(4 hours)
+    Description: EventBridge schedule that runs the weather cache refresher.
+  SesFromEmail:
+    Type: String
+    Default: no-reply@example.com
+    Description: Verified SES sender email address
+  SmsSenderId:
+    Type: String
+    Default: LANDSCAPE
+    Description: Alphanumeric SMS sender ID (subject to country rules)
+  UserServiceUrl:
+    Type: String
+    Description: User Service API base URL
+    Default: https://users-api.landscaping.com
+  ServicesServiceUrl:
+    Type: String
+    Description: Services Service API base URL
+    Default: https://services-api.landscaping.com
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 30
+    Tracing: Active
+    Handler: app.handler
+    ReservedConcurrentExecutions: 5
+    
+    #Filter and keep only common required envs at global level
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        PROJECT_NAME: !Ref ProjectName
+        APPOINTMENTS_TABLE_NAME: !Sub '${Environment}-${ProjectName}-appointments'
+        USER_SERVICE_URL: !Ref UserServiceUrl
+        SERVICES_SERVICE_URL: !Ref ServicesServiceUrl
+        WEATHER_CHECK_QUEUE_URL: !Ref WeatherCheckQueue
+        REMINDER_QUEUE_URL: !Ref ReminderQueue
+        NOTIFICATIONS_TOPIC_ARN: !Ref NotificationsTopic
+        WEATHER_API_KEY_SECRET_ARN: !Ref WeatherApiKeySecretArn
+        API_TIMEOUT: 5
+        WEATHER_TRACKING_TABLE_NAME: !Sub '${Environment}-${ProjectName}-weather-tracking'
+        WEATHER_CACHE_TABLE_NAME: !Sub '${Environment}-${ProjectName}-weather-cache'
+    Tags:
+      Project: !Ref ProjectName
+      Environment: !Ref Environment
+      ManagedBy: SAM
+
+Resources:
+
+  AppointmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-${ProjectName}-appointments'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: appointment_id
+          AttributeType: S
+        - AttributeName: gsi_date_pk
+          AttributeType: S
+        - AttributeName: scheduled_at
+          AttributeType: S
+        - AttributeName: client_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: appointment_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by_date
+          Projection:
+            ProjectionType: ALL
+          KeySchema:
+            - AttributeName: gsi_date_pk
+              KeyType: HASH
+            - AttributeName: scheduled_at
+              KeyType: RANGE
+        - IndexName: by_client_history
+          Projection:
+            ProjectionType: ALL
+          KeySchema:
+            - AttributeName: client_id
+              KeyType: HASH
+            - AttributeName: scheduled_at
+              KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  ClientsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-${ProjectName}-clients'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: client_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: client_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Environment}-${ProjectName}-notifications'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  WeatherCheckDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-${ProjectName}-weather-check-dlq'
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  WeatherCheckQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-${ProjectName}-weather-check-queue'
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WeatherCheckDLQ.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  WeatherTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-${ProjectName}-weather-tracking'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: tracking_id, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: next_check_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: tracking_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by_status_nextcheck
+          Projection: { ProjectionType: ALL }
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: next_check_at, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: SAM }
+        - { Key: ServiceArea, Value: Weather }
+
+  WeatherCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-${ProjectName}-weather-cache'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: cache_key, AttributeType: S }
+      KeySchema:
+        - { AttributeName: cache_key, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: SAM }
+        - { Key: ServiceArea, Value: Weather }
+
+  ReminderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-${ProjectName}-reminder-dlq'
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  ReminderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-${ProjectName}-reminder-queue'
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReminderDLQ.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  NotificationTemplatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-${ProjectName}-notification-templates'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: template_id, AttributeType: S }
+        - { AttributeName: channel, AttributeType: S }
+        - { AttributeName: locale, AttributeType: S }
+      KeySchema:
+        - { AttributeName: template_id, KeyType: HASH }
+        - { AttributeName: version, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: by_channel_locale
+          Projection: { ProjectionType: ALL }
+          KeySchema:
+            - { AttributeName: channel, KeyType: HASH }
+            - { AttributeName: locale, KeyType: RANGE }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: SAM }
+        - { Key: ServiceArea, Value: Notification }
+
+  NotificationPreferencesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-${ProjectName}-notification-preferences'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: user_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: user_id, KeyType: HASH }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: SAM }
+        - { Key: ServiceArea, Value: Notification }
+
+  NotificationSendLogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-${ProjectName}-notification-sendlogs'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: notification_id, AttributeType: S }
+        - { AttributeName: user_id, AttributeType: S }
+        - { AttributeName: sent_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: notification_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by_user_sent_at
+          Projection: { ProjectionType: KEYS_ONLY }
+          KeySchema:
+            - { AttributeName: user_id, KeyType: HASH }
+            - { AttributeName: sent_at, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: SAM }
+        - { Key: ServiceArea, Value: Notification }
+
+  NotificationEventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-${ProjectName}-notification-events-dlq'
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: SAM }
+        - { Key: ServiceArea, Value: Notification }
+
+  NotificationEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-${ProjectName}-notification-events'
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationEventsDLQ.Arn
+        maxReceiveCount: 5
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: SAM }
+        - { Key: ServiceArea, Value: Notification }
+
+  NotificationEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref NotificationEventsQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSnsToSend
+            Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt NotificationEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NotificationsTopic
+
+  NotificationEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationEventsQueue.Arn
+      RawMessageDelivery: true
+
+  RestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${Environment}-${ProjectName}-api'
+      StageName: !Ref Environment
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'OPTIONS,POST'"
+        AllowHeaders: "'Content-Type,Idempotency-Key,X-Correlation-Id'"
+        AllowOrigin: "'*'"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+      OpenApiVersion: '3.0.1'
+      DefinitionBody:
+        openapi: 3.0.1
+        info:
+          title: !Sub '${ProjectName} ${Environment} API'
+          version: '1.0.0'
+        paths:
+          /appointments:
+            post:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri:
+                  Fn::Sub:
+                    - arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateAppointmentFunction.Arn}/invocations
+                    - {}
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/CreateAppointmentRequest'
+              responses:
+                '201':
+                  description: Created
+                '400':
+                  description: Bad Request
+                '409':
+                  description: Conflict (Idempotency)
+                '500':
+                  description: Internal Server Error
+        components:
+          schemas:
+            CreateAppointmentRequest:
+              type: object
+              required: [client_id, service_id, scheduled_at]
+              properties:
+                client_id:
+                  type: string
+                service_id:
+                  type: string
+                scheduled_at:
+                  type: string
+                  format: date-time
+                notes:
+                  type: string
+                  maxLength: 1024
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        ManagedBy: SAM
+
+  CreateAppointmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-${ProjectName}-create-appointment'
+      Description: Validate payload, create appointment (idempotent), enqueue weather check and reminder
+      CodeUri: serverless/src/functions
+      Handler: create_appointment.handler
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: DdbRW
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt AppointmentsTable.Arn
+                - !GetAtt ClientsTable.Arn
+                - !GetAtt WeatherTrackingTable.Arn
+            - Sid: SQSSend
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource:
+                - !GetAtt WeatherCheckQueue.Arn
+                - !GetAtt ReminderQueue.Arn
+            - Sid: GetSecret
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !If
+                - HasSecret
+                - !Ref WeatherApiKeySecretArn
+                - !Ref AWS::NoValue
+      Events:
+        ApiPostAppointments:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /appointments
+            Method: post
+
+  CheckWeatherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-${ProjectName}-check-weather'
+      Description: EventBridge-scheduled job to refresh daily weather cache for due locations
+      CodeUri: serverless/src/functions
+      Handler: check_weather.handler
+      Timeout: 120
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          WEATHER_TRACKING_TABLE_NAME: !Ref WeatherTrackingTable
+          WEATHER_CACHE_TABLE_NAME: !Ref WeatherCacheTable
+          WEATHER_API_KEY_SECRET_ARN: !Ref WeatherApiKeySecretArn
+          MAX_LOCATIONS_PER_CYCLE: 200
+          LOOKAHEAD_DAYS: 7
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: WeatherDdbAccess
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt WeatherTrackingTable.Arn
+                - !Sub '${WeatherTrackingTable.Arn}/index/by_status_nextcheck'
+                - !GetAtt WeatherCacheTable.Arn
+            - Sid: SecretsRead
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !If [ HasSecret, !Ref WeatherApiKeySecretArn, !Ref AWS::NoValue ]
+      Events:
+        WeatherRefreshSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref WeatherRefreshRate
+            Name: !Sub '${Environment}-${ProjectName}-weather-refresh'
+            Description: Refresh daily weather cache from tracking (EventBridge)
+            Enabled: true
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        ManagedBy: SAM
+        ServiceArea: Weather
+
+  SendReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-${ProjectName}-send-reminder'
+      Description: Consumes ReminderQueue and dispatches appointment reminders via email/SMS/push
+      CodeUri: serverless/src/functions
+      Handler: send_reminder.handler
+      Runtime: python3.11
+      Timeout: 60
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          TEMPLATES_TABLE_NAME: !Ref NotificationTemplatesTable
+          PREFERENCES_TABLE_NAME: !Ref NotificationPreferencesTable
+          SEND_LOGS_TABLE_NAME: !Ref NotificationSendLogsTable
+          SES_FROM_EMAIL: !Ref SesFromEmail
+          SMS_SENDER_ID: !Ref SmsSenderId
+          NOTIFICATIONS_TOPIC_ARN: !Ref NotificationsTopic
+          USER_SERVICE_URL: !Ref UserServiceUrl
+          APPOINTMENTS_TABLE_NAME: !Sub '${Environment}-${ProjectName}-appointments'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ReadTemplatesAndPrefs
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+              Resource:
+                - !GetAtt NotificationTemplatesTable.Arn
+                - !Sub '${NotificationTemplatesTable.Arn}/index/by_channel_locale'
+                - !GetAtt NotificationPreferencesTable.Arn
+            - Sid: WriteSendLogs
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt NotificationSendLogsTable.Arn
+            - Sid: SesSend
+              Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+            - Sid: SnsPublish
+              Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref NotificationsTopic
+      Events:
+        ReminderQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReminderQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 2
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        ManagedBy: SAM
+        ServiceArea: Notification
+
+  CreateAppointmentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CreateAppointmentFunction}'
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  CheckWeatherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CheckWeatherFunction}'
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  SendReminderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SendReminderFunction}'
+      RetentionInDays: !Ref LogRetentionInDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+Conditions:
+  HasSecret: !Not [ !Equals [ !Ref WeatherApiKeySecretArn, "" ] ]
+
+Outputs:
+  ApiBaseUrl:
+    Description: API base URL
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${Environment}-${ProjectName}-api-url'
+
+  AppointmentsTableName:
+    Description: Appointments table name
+    Value: !Ref AppointmentsTable
+    Export:
+      Name: !Sub '${Environment}-${ProjectName}-appointments-table'
+
+  ClientsTableName:
+    Description: Clients table name
+    Value: !Ref ClientsTable
+    Export:
+      Name: !Sub '${Environment}-${ProjectName}-clients-table'
+
+  WeatherCheckQueueUrl:
+    Description: Weather check queue URL
+    Value: !Ref WeatherCheckQueue
+
+  ReminderQueueUrl:
+    Description: Reminder queue URL
+    Value: !Ref ReminderQueue
+
+  NotificationsTopicArn:
+    Description: SNS notifications topic ARN
+    Value: !Ref NotificationsTopic
+  
+  WeatherTrackingTableName:
+    Description: Weather tracking table name
+    Value: !Ref WeatherTrackingTable
+  
+  WeatherCacheTableName:
+    Description: Weather cache table name
+    Value: !Ref WeatherCacheTable
+  
+  NotificationTemplatesTableName:
+    Value: !Ref NotificationTemplatesTable
+  
+  NotificationPreferencesTableName:
+    Value: !Ref NotificationPreferencesTable
+  
+  NotificationSendLogsTableName:
+    Value: !Ref NotificationSendLogsTable
+  
+  NotificationEventsQueueUrl:
+    Value: !Ref NotificationEventsQueue
