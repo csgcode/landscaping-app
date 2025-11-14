@@ -15,6 +15,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "black>=25.9.0",
+    "cfn-lint>=1.40.4",
     "pytest>=8.4.2",
     "pytest-django>=4.11.1",
     "ruff>=0.14.2",
